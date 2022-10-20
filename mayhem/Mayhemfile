@@ -5,7 +5,7 @@ project: encore
 target: encore-fromstring-fuzz
 
 # Base image to run the binary in.
-image: ghcr.io/lotdeef/encore:latest
+# image: ghcr.io/lotdeef/encore:latest
 
 # List of commands used to test the target
 cmds:
