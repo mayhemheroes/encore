@@ -1,0 +1,27 @@
+! parse
+err 'The pubsub.NewTopic must be topic name be defined in "kebab-case"'
+
+-- svc/svc.go --
+package svc
+
+import (
+    "context"
+
+    "test/shared"
+    "test/svc/domain"
+
+    "encore.dev/pubsub"
+)
+
+type MessageType struct {
+    Name string
+}
+
+var (
+    BasicTopic = pubsub.NewTopic[*MessageType]("basic topic", pubsub.TopicConfig{ DeliveryGuarantee: pubsub.AtLeastOnce })
+)
+
+// encore:api
+func DoStuff(ctx context.Context) error {
+    return BasicTopic.Publish(ctx, &MessageType{Name: "foo"})
+}

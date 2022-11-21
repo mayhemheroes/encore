@@ -1,0 +1,31 @@
+# Verify that pub sub is parsed
+! parse
+err 'A PubSub topic name must be unique within an application.'
+
+-- shared/topics.go --
+package shared
+
+import (
+    "encore.dev/pubsub"
+)
+
+type MessageType struct {
+    Name string
+}
+
+var BasicTopic = pubsub.NewTopic[*MessageType]("same-name", pubsub.TopicConfig{ DeliveryGuarantee: pubsub.AtLeastOnce })
+
+-- svc/svc.go --
+package svc
+
+import (
+    "context"
+
+    "encore.dev/pubsub"
+)
+
+type MessageType struct {
+    Name string
+}
+
+var AnotherTopic = pubsub.NewTopic[*MessageType]("same-name", pubsub.TopicConfig{ DeliveryGuarantee: pubsub.AtLeastOnce })

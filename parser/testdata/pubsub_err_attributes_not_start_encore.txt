@@ -1,0 +1,16 @@
+# Verify that pub sub is parsed
+! parse
+err 'PubSub message attributes must not be prefixed with "encore".'
+
+-- shared/topics.go --
+package shared
+
+import (
+    "encore.dev/pubsub"
+)
+
+type MessageType struct {
+    Name string `pubsub-attr:"encorename"`
+}
+
+var BasicTopic = pubsub.NewTopic[*MessageType]("same-name", pubsub.TopicConfig{ DeliveryGuarantee: pubsub.AtLeastOnce })
