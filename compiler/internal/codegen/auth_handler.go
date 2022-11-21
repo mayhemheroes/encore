@@ -54,7 +54,6 @@ func (b *authHandlerBuilder) Write() {
 		Id("HasAuthData").Op(":").Lit(b.ah.AuthData != nil),
 		Id("DecodeAuth").Op(":").Add(decodeAuth),
 		Id("AuthHandler").Op(":").Add(authHandler),
-		Id("SerializeParams").Op(":").Add(paramDesc.Serialize),
 	)
 
 	for _, part := range [...]Code{
@@ -152,6 +151,23 @@ func (b *authHandlerBuilder) renderAuthHandler() *Statement {
 		Id("ctx").Qual("context", "Context"),
 		Id("params").Add(b.ParamsType()),
 	).Params(Id("info").Qual("encore.dev/appruntime/model", "AuthInfo"), Err().Error()).BlockFunc(func(g *Group) {
+		// fnExpr is the expression for the function we want to call,
+		// either just MyRPCName or svc.MyRPCName if we have a service struct.
+		var fnExpr *Statement
+
+		// If we have a service struct, initialize it first.
+		group := b.ah.SvcStruct
+		if group != nil {
+			ss := b.ah.Svc.Struct
+			g.List(Id("svc"), Id("initErr")).Op(":=").Qual(b.ah.Svc.Root.ImportPath, b.serviceStructName(ss)).Dot("Get").Call()
+			g.If(Id("initErr").Op("!=").Nil()).Block(
+				Return(Id("info"), Id("initErr")),
+			)
+			fnExpr = Id("svc").Dot(b.ah.Name)
+		} else {
+			fnExpr = Qual(b.ah.Svc.Root.ImportPath, b.ah.Name)
+		}
+
 		threeParams := b.ah.AuthData != nil
 		g.ListFunc(func(g *Group) {
 			g.Id("info").Dot("UID")
@@ -159,7 +175,7 @@ func (b *authHandlerBuilder) renderAuthHandler() *Statement {
 				g.Id("info").Dot("UserData")
 			}
 			g.Err()
-		}).Op("=").Qual(b.ah.Svc.Root.ImportPath, b.ah.Name).Call(Id("ctx"), Id("params"))
+		}).Op("=").Add(fnExpr).Call(Id("ctx"), Id("params"))
 		g.Return(Id("info"), Err())
 	})
 }
@@ -174,18 +190,6 @@ func (b *authHandlerBuilder) renderAuthHandlerStructDesc() structCodegen {
 		} else {
 			s.Add(b.schemaTypeToGoType(derefPointer(ah.Params)))
 		}
-	})
-
-	result.Serialize = Func().Params(
-		Id("json").Qual("github.com/json-iterator/go", "API"),
-		Id("params").Add(b.ParamsType()),
-	).Params(
-		Index().Index().Byte(),
-		Error(),
-	).BlockFunc(func(g *Group) {
-		g.List(Id("v"), Err()).Op(":=").Id("json").Dot("Marshal").Call(Id("params"))
-		g.If(Err().Op("!=").Nil()).Block(Return(Nil(), Err()))
-		g.Return(Index().Index().Byte().Values(Id("v")), Nil())
 	})
 
 	result.Clone = Func().Params(

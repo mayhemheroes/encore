@@ -21,6 +21,7 @@ import (
 
 	"encr.dev/compiler/internal/codegen"
 	"encr.dev/compiler/internal/cuegen"
+	"encr.dev/internal/experiments"
 	"encr.dev/internal/optracker"
 	"encr.dev/parser"
 	"encr.dev/parser/est"
@@ -76,6 +77,9 @@ type Config struct {
 	// Test is the specific settings for running tests.
 	Test *TestConfig
 
+	// ExecScript is the specific settings for executing scripts.
+	ExecScript *ExecScriptConfig
+
 	// The meta config we pass to CUE when computing the runtime configuration for the services within this
 	// application
 	Meta *cueutil.Meta
@@ -89,6 +93,9 @@ type Config struct {
 
 	// OpTracker is an option tracker to output the progress to the UI
 	OpTracker *optracker.OpTracker
+
+	// Are experimental features of Encore switched on?
+	Experiments *experiments.Set
 }
 
 // Validate validates the config.
@@ -250,13 +257,14 @@ func (b *builder) parseApp() error {
 
 	if pc := b.cfg.Parse; pc != nil {
 		b.res = pc
-		b.codegen = codegen.NewBuilder(b.res, b.forTesting)
+		b.codegen = codegen.NewBuilder(b.res)
 		b.cuegen = cuegen.NewGenerator(b.res)
 		return nil
 	}
 
 	cfg := &parser.Config{
 		AppRoot:                  b.appRoot,
+		Experiments:              b.cfg.Experiments,
 		AppRevision:              b.cfg.Revision,
 		AppHasUncommittedChanges: b.cfg.UncommittedChanges,
 		ModulePath:               b.modfile.Module.Mod.Path,
@@ -266,7 +274,7 @@ func (b *builder) parseApp() error {
 	b.res, err = parser.Parse(cfg)
 
 	if err == nil {
-		b.codegen = codegen.NewBuilder(b.res, b.forTesting)
+		b.codegen = codegen.NewBuilder(b.res)
 		b.cuegen = cuegen.NewGenerator(b.res)
 	}
 
@@ -408,7 +416,15 @@ func (b *builder) buildMain() error {
 		"-o=" + filepath.Join(b.workdir, "out"+b.exe()),
 	}
 	if b.cfg.StaticLink {
-		args = append(args, "-ldflags", `-extldflags "-static"`)
+		var ldflags string
+
+		// Enable external linking if we use cgo.
+		if b.cfg.CgoEnabled {
+			ldflags = "-linkmode external "
+		}
+
+		ldflags += `-extldflags "-static"`
+		args = append(args, "-ldflags", ldflags)
 	}
 
 	args = append(args, fmt.Sprintf("./%s/%s", encorePkgDir, mainPkgName))

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"time"
 
@@ -21,36 +20,7 @@ import (
 	"encr.dev/internal/version"
 	"encr.dev/parser"
 	"encr.dev/pkg/cueutil"
-	"encr.dev/pkg/vcs"
 )
-
-// Check checks the app for errors.
-// It reports a buildDir (if available) when codegenDebug is true.
-func (mgr *Manager) Check(ctx context.Context, appRoot, relwd string, codegenDebug bool) (buildDir string, err error) {
-	vcsRevision := vcs.GetRevision(appRoot)
-
-	// TODO: We should check that all secret keys are defined as well.
-	cfg := &compiler.Config{
-		Revision:              vcsRevision.Revision,
-		UncommittedChanges:    vcsRevision.Uncommitted,
-		WorkingDir:            relwd,
-		CgoEnabled:            true,
-		EncoreCompilerVersion: fmt.Sprintf("EncoreCLI/%s", version.Version),
-		EncoreRuntimePath:     env.EncoreRuntimePath(),
-		EncoreGoRoot:          env.EncoreGoRoot(),
-		KeepOutput:            codegenDebug,
-		BuildTags:             []string{"encore_local"},
-	}
-	result, err := compiler.Build(appRoot, cfg)
-	if result != nil && result.Dir != "" {
-		if codegenDebug {
-			buildDir = result.Dir
-		} else {
-			os.RemoveAll(result.Dir)
-		}
-	}
-	return buildDir, err
-}
 
 // TestParams groups the parameters for the Test method.
 type TestParams struct {
@@ -81,14 +51,16 @@ type TestParams struct {
 
 // Test runs the tests.
 func (mgr *Manager) Test(ctx context.Context, params TestParams) (err error) {
-	var secrets map[string]string
-	if pid := params.App.PlatformID(); pid != "" {
-		data, err := mgr.Secret.Get(ctx, pid)
-		if err != nil {
-			return err
-		}
-		secrets = data.Values
+	expSet, err := params.App.Experiments(params.Environ)
+	if err != nil {
+		return err
 	}
+
+	secretData, err := mgr.Secret.Get(ctx, params.App, expSet)
+	if err != nil {
+		return err
+	}
+	secrets := secretData.Values
 
 	var (
 		sqlServers []*config.SQLServer
@@ -141,6 +113,7 @@ func (mgr *Manager) Test(ctx context.Context, params TestParams) (err error) {
 	}
 
 	cfg := &compiler.Config{
+		Parse:                 params.Parse,
 		Revision:              params.Parse.Meta.AppRevision,
 		UncommittedChanges:    params.Parse.Meta.UncommittedChanges,
 		WorkingDir:            params.WorkingDir,
@@ -148,7 +121,8 @@ func (mgr *Manager) Test(ctx context.Context, params TestParams) (err error) {
 		EncoreCompilerVersion: fmt.Sprintf("EncoreCLI/%s", version.Version),
 		EncoreRuntimePath:     env.EncoreRuntimePath(),
 		EncoreGoRoot:          env.EncoreGoRoot(),
-		BuildTags:             []string{"encore_local"},
+		BuildTags:             []string{"encore_local", "encore_no_gcp", "encore_no_aws", "encore_no_azure"},
+		Experiments:           expSet,
 		Meta: &cueutil.Meta{
 			APIBaseURL: apiBaseURL,
 			EnvName:    "local",

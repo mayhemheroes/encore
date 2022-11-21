@@ -4,35 +4,61 @@ import (
 	"go/ast"
 	"strings"
 
+	"golang.org/x/exp/slices"
+
 	"encr.dev/parser/dnsname"
 	"encr.dev/parser/est"
 	"encr.dev/parser/internal/names"
 	"encr.dev/parser/internal/walker"
+	"encr.dev/pkg/errinsrc/srcerrors"
 )
 
 // parseResources parses infrastructure resources declared in the packages.
 // These are defined by calls to registerResource and registerResourceCreationParser.
 func (p *parser) parseResources() {
 	maxPhases := 0
+	pkgsByPhase := make(map[int][]string)
+
 	for _, res := range resourceTypes {
 		if res.PhaseNum > maxPhases {
 			maxPhases = res.PhaseNum
 		}
+		if !slices.Contains(pkgsByPhase[res.PhaseNum], res.PkgPath) {
+			pkgsByPhase[res.PhaseNum] = append(pkgsByPhase[res.PhaseNum], res.PkgPath)
+		}
 	}
 
 	for phase := 0; phase <= maxPhases; phase++ {
+		interestingPkgs := pkgsByPhase[phase]
 		for _, pkg := range p.pkgs {
+			// If the package does not contain any imports we care about in this phase, skip it.
+			if !mapContainsAny(pkg.Imports, interestingPkgs) {
+				continue
+			}
+
 			for _, file := range pkg.Files {
+				if !mapContainsAny(file.Imports, interestingPkgs) {
+					continue
+				}
 				walker.Walk(file.AST, &resourceCreationVisitor{p, file, p.names, phase})
 			}
 		}
 
 		if p.errors.Len() > 0 {
-			// Stop parsing phases if we encountere errors, as future phases will probably have errors which end up being
-			// caused by these errors (such as pubusb.Subscriptions needing pubsub.Topics to be parsed first)
+			// Stop parsing phases if we encounter errors, as future phases will probably have errors which end up being
+			// caused by these errors (such as pubsub.Subscriptions needing pubsub.Topics to be parsed first)
 			break
 		}
 	}
+}
+
+func mapContainsAny(imports map[string]bool, pkgsPaths []string) bool {
+	for _, pkg := range pkgsPaths {
+		if imports[pkg] {
+			return true
+		}
+	}
+	return false
 }
 
 type resourceCreationVisitor struct {
@@ -149,27 +175,27 @@ func (p *parser) resourceFor(file *est.File, node ast.Expr) est.Resource {
 
 // parseResourceName checks the given node is a string literal, and then checks it conforms
 // to the DNS-1035 label spec:
-//  - lowercase alpha-numeric, dashes
-//  - must start and with a letter
-//  - must not end with a dash
-//  - must be between 1 and 63 characters long
+//   - lowercase alpha-numeric, dashes
+//   - must start and with a letter
+//   - must not end with a dash
+//   - must be between 1 and 63 characters long
 //
 // If an error is encountered, it will report a parse error and return an empty string
 // otherwise it will return the parsed resource name
 func (p *parser) parseResourceName(resourceType string, paramName string, node ast.Expr) string {
 	name, ok := litString(node)
 	if !ok {
-		p.errf(node.Pos(), "%s requires the %s to be a string literal, was given %s.", resourceType, paramName, prettyPrint(node))
+		p.errInSrc(srcerrors.ResourceNameNotStringLiteral(p.fset, node, resourceType, paramName))
 		return ""
 	}
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > dnsname.DNS1035LabelMaxLength {
-		p.errf(node.Pos(), "%s requires the %s to be between 1 and %d characters long.", resourceType, paramName, dnsname.DNS1035LabelMaxLength)
+		p.errInSrc(srcerrors.ResourceNameWrongLength(p.fset, node, resourceType, paramName, name))
 		return ""
 	}
 
 	if !dnsname.Dns1035LabelRegexp.MatchString(name) {
-		p.errf(node.Pos(), "%s requires the %s to be between \"kebab-case\". It must start with a letter, end with a letter or number and only contain lower case letters, numbers and dashes.", resourceType, paramName)
+		p.errInSrc(srcerrors.ResourceNameNotKebabCase(p.fset, node, resourceType, paramName, name))
 		return ""
 	}
 

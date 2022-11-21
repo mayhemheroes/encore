@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/benbjohnson/clock"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/julienschmidt/httprouter"
 	"github.com/rs/zerolog"
@@ -13,12 +14,11 @@ import (
 	encore "encore.dev"
 	"encore.dev/appruntime/config"
 	"encore.dev/appruntime/cors"
+	"encore.dev/appruntime/metrics"
 	"encore.dev/appruntime/model"
 	"encore.dev/appruntime/platform"
 	"encore.dev/appruntime/reqtrack"
-	"encore.dev/appruntime/trace"
 	"encore.dev/beta/errs"
-	"encore.dev/internal/metrics"
 )
 
 type Access string
@@ -33,7 +33,7 @@ const (
 type execContext struct {
 	server *Server
 	ctx    context.Context
-	ps     PathParams
+	ps     UnnamedParams
 	auth   model.AuthInfo
 }
 
@@ -41,13 +41,18 @@ type IncomingContext struct {
 	execContext
 	w   http.ResponseWriter
 	req *http.Request
+
+	// capturer is set in handleIncoming for raw requests
+	// to capture the request body
+	capturer *rawRequestBodyCapturer
 }
 
 type Handler interface {
 	ServiceName() string
 	EndpointName() string
 	AccessType() Access
-	HTTPPath() string
+	SemanticPath() string
+	HTTPRouterPath() string
 	HTTPMethods() []string
 	SetMiddleware([]*Middleware)
 	Handle(c IncomingContext)
@@ -58,7 +63,9 @@ type Server struct {
 	rt             *reqtrack.RequestTracker
 	pc             *platform.Client // if nil, requests are not authenticated against platform
 	encoreMgr      *encore.Manager
+	clock          clock.Clock
 	rootLogger     zerolog.Logger
+	metrics        *metrics.Manager
 	json           jsoniter.API
 	tracingEnabled bool
 
@@ -74,8 +81,17 @@ type Server struct {
 	pubsubSubscriptions map[string]func(r *http.Request) error
 }
 
-func NewServer(cfg *config.Config, rt *reqtrack.RequestTracker, pc *platform.Client,
-	encoreMgr *encore.Manager, rootLogger zerolog.Logger, json jsoniter.API) *Server {
+func NewServer(
+	cfg *config.Config,
+	rt *reqtrack.RequestTracker,
+	pc *platform.Client,
+	encoreMgr *encore.Manager,
+	rootLogger zerolog.Logger,
+	metrics *metrics.Manager,
+	json jsoniter.API,
+	tracingEnabled bool,
+	clock clock.Clock,
+) *Server {
 	public := httprouter.New()
 	public.HandleOPTIONS = false
 	public.RedirectFixedPath = false
@@ -96,9 +112,11 @@ func NewServer(cfg *config.Config, rt *reqtrack.RequestTracker, pc *platform.Cli
 		pc:             pc,
 		rt:             rt,
 		encoreMgr:      encoreMgr,
+		clock:          clock,
 		rootLogger:     rootLogger,
+		metrics:        metrics,
 		json:           json,
-		tracingEnabled: trace.Enabled(cfg),
+		tracingEnabled: tracingEnabled,
 
 		public:  public,
 		private: private,
@@ -158,12 +176,11 @@ func (s *Server) register(reg HandlerRegistration, logRegistration bool) {
 	h := reg.Handler
 	h.SetMiddleware(reg.Middleware)
 
-	path := h.HTTPPath()
 	if logRegistration {
 		s.rootLogger.Info().
 			Str("service", h.ServiceName()).
 			Str("endpoint", h.EndpointName()).
-			Str("path", path).
+			Str("path", h.SemanticPath()).
 			Msg("registered API endpoint")
 	}
 
@@ -173,12 +190,14 @@ func (s *Server) register(reg HandlerRegistration, logRegistration bool) {
 		}
 
 		adapter := func(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
-			s.processRequest(h, s.NewIncomingContext(w, req, ps, model.AuthInfo{}))
+			params := toUnnamedParams(ps)
+			s.processRequest(h, s.NewIncomingContext(w, req, params, model.AuthInfo{}))
 		}
 
-		s.private.Handle(m, path, adapter)
+		routerPath := h.HTTPRouterPath()
+		s.private.Handle(m, routerPath, adapter)
 		if access := h.AccessType(); access == Public || access == RequiresAuth {
-			s.public.Handle(m, path, adapter)
+			s.public.Handle(m, routerPath, adapter)
 		}
 	}
 }
@@ -193,8 +212,6 @@ func (s *Server) Shutdown(force context.Context) {
 }
 
 func (s *Server) handler(w http.ResponseWriter, req *http.Request) {
-	ep := strings.TrimPrefix(req.URL.Path, "/")
-
 	// Select a router based on access
 	r := s.public
 
@@ -202,6 +219,9 @@ func (s *Server) handler(w http.ResponseWriter, req *http.Request) {
 	// and authenticate it, then we can switch over to the private router which contains all APIs not just
 	// the publicly accessible ones.
 	if sig := req.Header.Get("X-Encore-Auth"); sig != "" && s.pc != nil {
+		// Delete the header so it can't be accessed.
+		req.Header.Del("X-Encore-Auth")
+
 		if ok, err := s.pc.ValidatePlatformRequest(req, sig); err == nil && ok {
 			// Successfully authenticated
 			req = req.WithContext(withEncorePlatformSealOfApproval(req.Context()))
@@ -240,11 +260,6 @@ func (s *Server) handler(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Endpoint not found
-	svc, api := "unknown", "Unknown"
-	if idx := strings.IndexByte(ep, '.'); idx != -1 {
-		svc, api = ep[:idx], ep[idx+1:]
-	}
-	metrics.UnknownEndpoint(svc, api)
 	errs.HTTPError(w, errs.B().Code(errs.NotFound).Msg("endpoint not found").Err())
 }
 
@@ -259,13 +274,13 @@ func (s *Server) processRequest(h Handler, c IncomingContext) {
 	}
 }
 
-func (s *Server) newExecContext(ctx context.Context, ps PathParams, auth model.AuthInfo) execContext {
+func (s *Server) newExecContext(ctx context.Context, ps UnnamedParams, auth model.AuthInfo) execContext {
 	return execContext{s, ctx, ps, auth}
 }
 
-func (s *Server) NewIncomingContext(w http.ResponseWriter, req *http.Request, ps PathParams, auth model.AuthInfo) IncomingContext {
+func (s *Server) NewIncomingContext(w http.ResponseWriter, req *http.Request, ps UnnamedParams, auth model.AuthInfo) IncomingContext {
 	ec := s.newExecContext(req.Context(), ps, auth)
-	return IncomingContext{ec, w, req}
+	return IncomingContext{ec, w, req, nil}
 }
 
 func (s *Server) NewCallContext(ctx context.Context) CallContext {
@@ -296,4 +311,12 @@ var Singleton *Server // for use in generated code
 
 func NewCallContext(ctx context.Context) CallContext {
 	return Singleton.NewCallContext(ctx)
+}
+
+func toUnnamedParams(ps httprouter.Params) UnnamedParams {
+	params := make(UnnamedParams, len(ps))
+	for i, p := range ps {
+		params[i] = p.Value
+	}
+	return params
 }

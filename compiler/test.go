@@ -28,9 +28,6 @@ type TestConfig struct {
 }
 
 // Test tests the application.
-//
-// On success, it is the caller's responsibility to delete the temp dir
-// returned in Result.Dir.
 func Test(ctx context.Context, appRoot string, cfg *Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -137,8 +134,17 @@ func (b *builder) runTests(ctx context.Context) error {
 		"-mod=mod",
 		"-vet=off",
 	}
+
 	if b.cfg.StaticLink {
-		args = append(args, "-ldflags", `-extldflags "-static"`)
+		var ldflags string
+
+		// Enable external linking if we use cgo.
+		if b.cfg.CgoEnabled {
+			ldflags = "-linkmode external "
+		}
+
+		ldflags += `-extldflags "-static"`
+		args = append(args, "-ldflags", ldflags)
 	}
 
 	args = append(args, b.cfg.Test.Args...)

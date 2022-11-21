@@ -28,9 +28,10 @@ type Application struct {
 }
 
 type File struct {
-	Name       string   // file name ("foo.go")
-	Pkg        *Package // package it belongs to
-	Path       string   // filesystem path
+	Name       string          // file name ("foo.go")
+	Pkg        *Package        // package it belongs to
+	Path       string          // filesystem path
+	Imports    map[string]bool // imports in the file, keyed by import path
 	AST        *ast.File
 	Token      *token.File
 	Contents   []byte
@@ -48,6 +49,7 @@ type Package struct {
 	Service    *Service // the service this package belongs to, if any
 	Secrets    []string
 	Resources  []Resource
+	Imports    map[string]bool // union of all imports from files
 }
 
 // A Service is a Go package that defines one or more RPCs.
@@ -87,12 +89,14 @@ type CronJob struct {
 	Schedule string
 	RPC      *RPC
 	DeclFile *File
+	DeclCall *ast.CallExpr
 	AST      *ast.Ident
 }
 
 func (cj *CronJob) Type() ResourceType         { return CronJobResource }
 func (cj *CronJob) File() *File                { return cj.DeclFile }
 func (cj *CronJob) Ident() *ast.Ident          { return cj.AST }
+func (cj *CronJob) DefNode() ast.Node          { return cj.DeclCall }
 func (cj *CronJob) NodeType() NodeType         { return CronJobNode }
 func (cj *CronJob) AllowOnlyParsedUsage() bool { return true }
 
@@ -113,12 +117,14 @@ func (cj *CronJob) IsValid() (bool, error) {
 
 type PubSubTopic struct {
 	Name              string          // The unique name of the pub sub topic
+	NameAST           ast.Node        // The AST node that defines the name of the pub sub topic
 	Doc               string          // The documentation on the pub sub topic
 	DeliveryGuarantee PubSubGuarantee // What guarantees does the pub sub topic have?
 	OrderingKey       string          // What field in the message type should be used to ensure First-In-First-Out (FIFO) for messages with the same key
 	DeclFile          *File           // What file the topic is declared in
-	MessageType       *Param          // The message type of the pub sub topic
-	IdentAST          *ast.Ident      // The AST node representing the value this topic is bound against
+	DeclCall          *ast.CallExpr
+	MessageType       *Param     // The message type of the pub sub topic
+	IdentAST          *ast.Ident // The AST node representing the value this topic is bound against
 
 	Subscribers []*PubSubSubscriber
 	Publishers  []*PubSubPublisher
@@ -126,6 +132,7 @@ type PubSubTopic struct {
 
 func (p *PubSubTopic) Type() ResourceType         { return PubSubTopicResource }
 func (p *PubSubTopic) File() *File                { return p.DeclFile }
+func (p *PubSubTopic) DefNode() ast.Node          { return p.DeclCall }
 func (p *PubSubTopic) Ident() *ast.Ident          { return p.IdentAST }
 func (p *PubSubTopic) NodeType() NodeType         { return PubSubTopicDefNode }
 func (p *PubSubTopic) AllowOnlyParsedUsage() bool { return false }
@@ -139,12 +146,14 @@ const (
 
 type PubSubSubscriber struct {
 	Name     string       // The unique name of the subscriber
+	NameAST  ast.Node     // The AST node that defines the name of the subscriber
 	Topic    *PubSubTopic // The topic the subscriber is registered against
 	CallSite ast.Node     // The AST node representing the creation of the subscriber
 	Func     ast.Node     // The function that is the subscriber (either a *ast.FuncLit or a *ast.FuncDecl)
 	FuncFile *File        // The file the subscriber function is declared in
 	DeclFile *File        // The file that the subscriber is defined in
-	IdentAST *ast.Ident   // The AST node representing the value this topic is bound against
+	DeclCall *ast.CallExpr
+	IdentAST *ast.Ident // The AST node representing the value this topic is bound against
 
 	AckDeadline      time.Duration
 	MessageRetention time.Duration
@@ -155,12 +164,17 @@ type PubSubSubscriber struct {
 
 func (p *PubSubSubscriber) Type() ResourceType         { return PubSubTopicResource }
 func (p *PubSubSubscriber) File() *File                { return p.DeclFile }
+func (p *PubSubSubscriber) DefNode() ast.Node          { return p.DeclCall }
 func (p *PubSubSubscriber) Ident() *ast.Ident          { return p.IdentAST }
 func (p *PubSubSubscriber) NodeType() NodeType         { return PubSubSubscriberNode }
 func (p *PubSubSubscriber) AllowOnlyParsedUsage() bool { return true }
 
 type PubSubPublisher struct {
 	DeclFile *File // The file the publisher is declared in
+
+	// One of
+	Service          *Service    // The service the publisher is declared in
+	GlobalMiddleware *Middleware // The name of the middleware target
 }
 
 type Param struct {
@@ -171,6 +185,19 @@ type Param struct {
 // IsPointer returns if this parameter is a a pointer or not
 func (p *Param) IsPointer() bool {
 	return p.IsPtr || p.Type.GetPointer() != nil
+}
+
+// GetWithPointer ensures that if the parameter is marked as a pointer
+// you get the pointer schema.type back
+func (p *Param) GetWithPointer() *schema.Type {
+	// If the parameter is a pointer, but the schema isn't a pointer, then
+	// we need to update the typ to a pointer so that the unmarshaler generates as the
+	// correct type
+	typ := p.Type
+	if p.IsPtr && typ.GetPointer() == nil {
+		typ = &schema.Type{Typ: &schema.Type_Pointer{Pointer: &schema.Pointer{Base: typ}}}
+	}
+	return typ
 }
 
 type AccessType string
@@ -233,12 +260,13 @@ type Node struct {
 }
 
 type AuthHandler struct {
-	Svc    *Service
-	Name   string
-	Doc    string
-	Func   *ast.FuncDecl
-	File   *File
-	Params *schema.Type // builtin string or named type
+	Svc       *Service
+	Name      string
+	Doc       string
+	Func      *ast.FuncDecl
+	File      *File
+	Params    *schema.Type   // builtin string or named type
+	SvcStruct *ServiceStruct // nil if not defined on a service struct
 
 	// AuthData is the custom auth data type the app may specify
 	// as part of the returns from the auth handler.
@@ -272,6 +300,7 @@ type Config struct {
 func (c *Config) Type() ResourceType         { return ConfigResource }
 func (c *Config) File() *File                { return c.DeclFile }
 func (c *Config) Ident() *ast.Ident          { return c.IdentAST }
+func (c *Config) DefNode() ast.Node          { return c.FuncCall }
 func (c *Config) NodeType() NodeType         { return ConfigLoadNode }
 func (c *Config) AllowOnlyParsedUsage() bool { return false }
 
@@ -279,6 +308,7 @@ type Resource interface {
 	Type() ResourceType
 	File() *File
 	Ident() *ast.Ident
+	DefNode() ast.Node
 	NodeType() NodeType
 	AllowOnlyParsedUsage() bool // If true this resource can only be used with registered resource parsers. If false we allow any usage.
 }
@@ -300,19 +330,22 @@ const (
 type SQLDB struct {
 	DeclFile *File
 	DeclName *ast.Ident // where the resource is declared
+	DeclCall *ast.CallExpr
 	DBName   string
 }
 
 func (r *SQLDB) Type() ResourceType         { return SQLDBResource }
 func (r *SQLDB) File() *File                { return r.DeclFile }
 func (r *SQLDB) Ident() *ast.Ident          { return r.DeclName }
+func (r *SQLDB) DefNode() ast.Node          { return r.DeclCall }
 func (r *SQLDB) NodeType() NodeType         { return SQLDBNode }
 func (r *SQLDB) AllowOnlyParsedUsage() bool { return false }
 
 type CacheCluster struct {
-	Name           string     // The unique name of the cache cluster
-	Doc            string     // The documentation on the cluster
-	DeclFile       *File      // What file the cache is declared in
+	Name           string // The unique name of the cache cluster
+	Doc            string // The documentation on the cluster
+	DeclFile       *File  // What file the cache is declared in
+	DeclCall       *ast.CallExpr
 	IdentAST       *ast.Ident // The AST node representing the value this cache cluster is bound against
 	EvictionPolicy string
 
@@ -322,14 +355,16 @@ type CacheCluster struct {
 func (p *CacheCluster) Type() ResourceType         { return CacheClusterResource }
 func (p *CacheCluster) File() *File                { return p.DeclFile }
 func (p *CacheCluster) Ident() *ast.Ident          { return p.IdentAST }
+func (r *CacheCluster) DefNode() ast.Node          { return r.DeclCall }
 func (p *CacheCluster) NodeType() NodeType         { return CacheClusterDefNode }
 func (p *CacheCluster) AllowOnlyParsedUsage() bool { return false }
 
 type CacheKeyspace struct {
 	Cluster   *CacheCluster
 	Svc       *Service
-	Doc       string     // The documentation on the cluster
-	DeclFile  *File      // What file the cache is declared in
+	Doc       string // The documentation on the cluster
+	DeclFile  *File  // What file the cache is declared in
+	DeclCall  *ast.CallExpr
 	IdentAST  *ast.Ident // The AST node representing the value this cache cluster is bound against
 	ConfigLit *ast.CompositeLit
 
@@ -341,5 +376,6 @@ type CacheKeyspace struct {
 func (p *CacheKeyspace) Type() ResourceType         { return CacheKeyspaceResource }
 func (p *CacheKeyspace) File() *File                { return p.DeclFile }
 func (p *CacheKeyspace) Ident() *ast.Ident          { return p.IdentAST }
+func (r *CacheKeyspace) DefNode() ast.Node          { return r.DeclCall }
 func (p *CacheKeyspace) NodeType() NodeType         { return CacheKeyspaceDefNode }
 func (p *CacheKeyspace) AllowOnlyParsedUsage() bool { return false }

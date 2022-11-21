@@ -9,15 +9,17 @@ import (
 	goparser "go/parser"
 	"go/scanner"
 	"go/token"
-	"os"
+	"io/fs"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
 	"golang.org/x/exp/slices"
 	"golang.org/x/tools/go/ast/astutil"
 
+	"encr.dev/internal/experiments"
 	"encr.dev/parser/est"
 	"encr.dev/parser/internal/names"
 	"encr.dev/parser/paths"
@@ -73,11 +75,17 @@ type parser struct {
 // TODO(domblack): Remove AppRevision and AppHasUncommittedChanges from here as it's compiler concern not a parser concern
 type Config struct {
 	AppRoot                  string
+	Experiments              *experiments.Set
 	AppRevision              string
 	AppHasUncommittedChanges bool
 	ModulePath               string
 	WorkingDir               string
 	ParseTests               bool
+
+	// ScriptMainPkg specifies the relative path to the main package,
+	// when running in script mode. It's used to mark that package
+	// as a synthetic "main" service.
+	ScriptMainPkg string
 }
 
 func Parse(cfg *Config) (*Result, error) {
@@ -121,7 +129,6 @@ func (p *parser) Parse() (res *Result, err error) {
 		}
 
 		if err == nil {
-			p.errors.Sort()
 			p.errors.MakeRelative(p.cfg.AppRoot, p.cfg.WorkingDir)
 			err = p.errors.Err()
 		}
@@ -129,7 +136,7 @@ func (p *parser) Parse() (res *Result, err error) {
 	p.fset = token.NewFileSet()
 	p.errors = errlist.New(p.fset)
 
-	p.pkgs, err = collectPackages(p.fset, p.cfg.AppRoot, p.cfg.ModulePath, goparser.ParseComments, p.cfg.ParseTests)
+	p.pkgs, err = collectPackages(p.fset, p.cfg.AppRoot, p.cfg.ModulePath, p.cfg.ScriptMainPkg, goparser.ParseComments, p.cfg.ParseTests)
 	if err != nil {
 		if errList, ok := err.(scanner.ErrorList); ok {
 			p.errors.Report(errList)
@@ -146,6 +153,7 @@ func (p *parser) Parse() (res *Result, err error) {
 	for pkgPath, name := range defaultTrackedPackages {
 		track[pkgPath] = name
 	}
+
 	p.resolveNames(track)
 	p.parseServices()
 	p.parseResources()
@@ -177,6 +185,7 @@ func (p *parser) Parse() (res *Result, err error) {
 		AuthHandler:   p.authHandler,
 		Middleware:    p.middleware,
 	}
+
 	md, nodes, err := ParseMeta(p.cfg.AppRevision, p.cfg.AppHasUncommittedChanges, p.cfg.AppRoot, app, p.fset)
 	if err != nil {
 		return nil, err
@@ -203,10 +212,12 @@ func encoreBuildContext() build.Context {
 
 // collectPackages collects and parses the regular Go AST
 // for all subdirectories in the root.
-func collectPackages(fs *token.FileSet, rootDir, rootImportPath string, mode goparser.Mode, parseTests bool) ([]*est.Package, error) {
+//
+// Main packages are ignored by default, except for mainPkgRelPath if set.
+func collectPackages(fset *token.FileSet, rootDir, rootImportPath, mainPkgRelPath string, mode goparser.Mode, parseTests bool) ([]*est.Package, error) {
 	var pkgs []*est.Package
 	var errors scanner.ErrorList
-	filter := func(f os.FileInfo) bool {
+	filter := func(f fs.DirEntry) bool {
 		// Don't parse encore.gen.go files, since they're not intended to be checked in.
 		// We've had several issues where things work locally but not in CI/CD because
 		// the encore.gen.go file was parsed for local development which papered over issues.
@@ -219,16 +230,10 @@ func collectPackages(fs *token.FileSet, rootDir, rootImportPath string, mode gop
 
 	buildContext := encoreBuildContext()
 
-	err := walkDirs(rootDir, func(dir, relPath string, files []os.FileInfo) error {
-		ps, pkgFiles, err := parseDir(buildContext, fs, dir, relPath, filter, mode)
+	parsePkg := func(dir, relPath string, files []fs.DirEntry) (*est.Package, error) {
+		ps, pkgFiles, err := parseDir(buildContext, fset, dir, files, filter, mode)
 		if err != nil {
-			// If the error is an error list, it means we have a parsing error.
-			// Keep going with other directories in that case.
-			if el, ok := err.(scanner.ErrorList); ok {
-				errors = append(errors, el...)
-				return nil
-			}
-			return err
+			return nil, err
 		}
 
 		var pkgNames []string
@@ -243,21 +248,20 @@ func collectPackages(fs *token.FileSet, rootDir, rootImportPath string, mode gop
 				// It's just a "_test" package; we're good.
 			} else {
 				namestr := strings.Join(pkgNames[:n-1], ", ") + " and " + pkgNames[n-1]
-				errors.Add(fs.Position(first.Pos()), "got multiple package names in directory: "+namestr)
-				return nil
+				errors.Add(fset.Position(first.Pos()), "got multiple package names in directory: "+namestr)
+				return nil, nil
 			}
 		} else if n == 0 {
 			// No Go files; ignore directory
-			return nil
+			return nil, nil
 		}
 
 		p := ps[pkgNames[0]]
-
 		var doc string
 		for _, astFile := range p.Files {
 			// HACK: getting package comments is not at all easy
 			// because of the quirks of go/ast. This seems to work.
-			cm := ast.NewCommentMap(fs, astFile, astFile.Comments)
+			cm := ast.NewCommentMap(fset, astFile, astFile.Comments)
 			for _, cg := range cm[astFile] {
 				if text := strings.TrimSpace(cg.Text()); text != "" {
 					doc = text
@@ -277,16 +281,94 @@ func collectPackages(fs *token.FileSet, rootDir, rootImportPath string, mode gop
 			RelPath:    path.Clean(relPath),
 			Dir:        dir,
 			Files:      pkgFiles,
+			Imports:    make(map[string]bool),
 		}
+
+		// Ignore main packages (they're scripts) unless we're executing that very main package
+		// as an exec script.
+		if pkg.Name == "main" && pkg.RelPath != mainPkgRelPath {
+			return nil, nil
+		}
+
 		for _, f := range pkgFiles {
 			f.Pkg = pkg
+
+			for importPath := range f.Imports {
+				pkg.Imports[importPath] = true
+			}
 		}
-		pkgs = append(pkgs, pkg)
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		return pkg, nil
 	}
+
+	type dirToParse struct {
+		dir     string
+		relPath string
+		files   []fs.DirEntry
+	}
+
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers < 4 {
+		numWorkers = 4
+	}
+
+	work := make(chan dirToParse, 100)
+	pkgCh := make(chan *est.Package, numWorkers)
+	errCh := make(chan error, numWorkers)
+	quit := make(chan struct{})
+	workerDone := make(chan struct{}, numWorkers)
+
+	worker := func() {
+		defer func() { workerDone <- struct{}{} }()
+		for d := range work {
+			pkg, err := parsePkg(d.dir, d.relPath, d.files)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if pkg != nil {
+				pkgCh <- pkg
+			}
+		}
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		go worker()
+	}
+
+	go func() {
+		err := walkDirs(rootDir, func(dir, relPath string, files []fs.DirEntry) error {
+			work <- dirToParse{dir: dir, relPath: relPath, files: files}
+			return nil
+		})
+		close(work) // no more work
+		if err != nil {
+			errCh <- err
+		}
+	}()
+
+	defer close(quit)
+	numWorkersDone := 0
+	for numWorkersDone < numWorkers {
+		select {
+		case pkg := <-pkgCh:
+			pkgs = append(pkgs, pkg)
+		case err := <-errCh:
+			// If the error is an error list, it means we have a parsing error.
+			// Keep going in that case.
+			if el, ok := err.(scanner.ErrorList); ok {
+				errors = append(errors, el...)
+			} else {
+				return nil, err
+			}
+
+		case <-workerDone:
+			numWorkersDone++
+		}
+	}
+
+	sort.Slice(pkgs, func(i, j int) bool {
+		return pkgs[i].RelPath < pkgs[j].RelPath
+	})
 	return pkgs, errors.Err()
 }
 
@@ -457,6 +539,8 @@ func (p *parser) parseReferences() {
 						// pubsub topic definitions are allowed outside of services
 					case est.CacheClusterDefNode:
 						// cache cluster definitions are allowed outside of services
+					case est.PubSubPublisherNode:
+						// we verify this inside the pubsub publisher parser
 					default:
 						p.errf(astNode.Pos(), "invalid reference outside of a service\n\tpackage %s is not considered a service (it has no APIs or pubsub subscribers defined)", pkg.Name)
 					}
@@ -576,9 +660,17 @@ func (p *parser) validateApp() {
 				default:
 					panic(fmt.Sprintf("unsupported resource type %v", res.Type()))
 				}
-				p.errf(res.Ident().Pos(), "cannot define %s resource in non-service package", resType)
+
+				pos := token.NoPos
+				if id := res.Ident(); id != nil {
+					pos = id.Pos()
+				} else {
+					pos = res.DefNode().Pos()
+				}
+				p.errf(pos, "cannot define %s resource in non-service package", resType)
 			}
 		}
+
 		for _, f := range pkg.Files {
 			if !strings.HasSuffix(f.Name, "_test.go") {
 				for _, imp := range f.AST.Imports {
@@ -589,7 +681,8 @@ func (p *parser) validateApp() {
 			}
 
 			for node, ref := range f.References {
-				if res := ref.Res; ref.Res != nil {
+				if res := ref.Res; ref.Res != nil &&
+					res.Type() != est.PubSubTopicResource { // PubSub topics are allow to be published to in global middleware, so it's ok to reference a topic outside a service
 					if ff := res.File(); ff.Pkg.Service != nil && (pkg.Service == nil || pkg.Service.Name != ff.Pkg.Service.Name) {
 						p.errf(node.Pos(), "cannot reference resource %s.%s outside the service", ff.Pkg.Name, res.Ident().Name)
 					}
@@ -603,10 +696,16 @@ func (p *parser) validateApp() {
 		for _, f := range pkg.Files {
 			astutil.Apply(f.AST, func(c *astutil.Cursor) bool {
 				node := c.Node()
-				if ref, ok := f.References[node]; ok && ref.Type == est.RPCRefNode && !p.validRPCReferences[node] {
-					if call, isCall := c.Parent().(*ast.CallExpr); !isCall || call.Fun != node {
-						rpc := ref.RPC
-						p.errf(node.Pos(), "cannot reference API endpoint %s.%s without calling it", rpc.Svc.Name, rpc.Name)
+				if ref, ok := f.References[node]; ok && ref.Type == est.RPCRefNode {
+					rpc := ref.RPC
+					if !p.validRPCReferences[node] {
+						if call, isCall := c.Parent().(*ast.CallExpr); !isCall || call.Fun != node {
+							p.errf(node.Pos(), "cannot reference API endpoint %s.%s without calling it", rpc.Svc.Name, rpc.Name)
+						}
+					}
+					if rpc.Raw {
+						p.errf(node.Pos(), "calling raw API endpoint %s.%s from another endpoint is not yet supported",
+							rpc.Svc.Name, rpc.Name)
 					}
 				}
 				return true

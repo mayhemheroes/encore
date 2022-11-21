@@ -48,7 +48,8 @@ Supported language codes are:
 			if lang == "" {
 				var ok bool
 				l, ok := clientgen.Detect(output)
-				if !ok {
+				// Temporarily disable JavaScript in the CLI
+				if !ok || l == clientgen.LangJavascript {
 					fatal("could not detect language from output.\n\nNote: you can specify the language explicitly with --lang.")
 				}
 				lang = string(l)
@@ -118,7 +119,7 @@ which may require the user-facing wrapper code to be manually generated.`,
 
 	genClientCmd.Flags().StringVarP(&lang, "lang", "l", "", "The language to generate code for (\"typescript\" and \"go\" are supported)")
 	_ = genClientCmd.RegisterFlagCompletionFunc("lang", autoCompleteFromStaticList(
-		"typescript\tA TypeScript-client using the in-browser Fetch API",
+		"typescript\tA TypeScript client using the in-browser Fetch API",
 		"go\tA Go client using net/http",
 	))
 

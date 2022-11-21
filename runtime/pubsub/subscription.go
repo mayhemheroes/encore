@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	jsoniter "github.com/json-iterator/go"
+
 	"encore.dev/appruntime/config"
 	"encore.dev/appruntime/model"
 	"encore.dev/appruntime/trace"
@@ -32,25 +34,25 @@ type Subscription[T any] struct {
 //
 // Example:
 //
-//     import "encore.dev/pubsub"
+//	import "encore.dev/pubsub"
 //
-//     type MyEvent struct {
-//       Foo string
-//     }
+//	type MyEvent struct {
+//	  Foo string
+//	}
 //
-//     var MyTopic = pubsub.NewTopic[*MyEvent]("my-topic", pubsub.TopicConfig{
-//       DeliveryGuarantee: pubsub.AtLeastOnce,
-//     })
+//	var MyTopic = pubsub.NewTopic[*MyEvent]("my-topic", pubsub.TopicConfig{
+//	  DeliveryGuarantee: pubsub.AtLeastOnce,
+//	})
 //
-//     var Subscription = pubsub.NewSubscription(MyTopic, "my-subscription", pubsub.SubscriptionConfig[*MyEvent]{
-//       Handler:     HandleEvent,
-//       RetryPolicy: &pubsub.RetryPolicy { MaxRetries: 10 },
-//     })
+//	var Subscription = pubsub.NewSubscription(MyTopic, "my-subscription", pubsub.SubscriptionConfig[*MyEvent]{
+//	  Handler:     HandleEvent,
+//	  RetryPolicy: &pubsub.RetryPolicy { MaxRetries: 10 },
+//	})
 //
-//     func HandleEvent(ctx context.Context, event *MyEvent) error {
-//       rlog.Info("received foo")
-//       return nil
-//     }
+//	func HandleEvent(ctx context.Context, event *MyEvent) error {
+//	  rlog.Info("received foo")
+//	  return nil
+//	}
 func NewSubscription[T any](topic *Topic[T], name string, subscriptionCfg SubscriptionConfig[T]) *Subscription[T] {
 	if topic.topicCfg == nil || topic.topic == nil || topic.mgr == nil {
 		panic("pubsub topic was not created using pubsub.NewTopic")
@@ -122,26 +124,21 @@ func NewSubscription[T any](topic *Topic[T], name string, subscriptionCfg Subscr
 
 		// Start the request tracing span
 		req := &model.Request{
-			Type:    model.PubSubMessage,
-			SpanID:  spanID,
-			Service: staticCfg.Service,
-			Start:   time.Now(),
+			Type:   model.PubSubMessage,
+			SpanID: spanID,
+			Start:  time.Now(),
 			MsgData: &model.PubSubMsgData{
-				Topic:        topic.topicCfg.EncoreName,
-				Subscription: subscription.EncoreName,
-				MessageID:    msgID,
-				Attempt:      deliveryAttempt,
-				Published:    publishTime,
+				Service:        staticCfg.Service,
+				Topic:          topic.topicCfg.EncoreName,
+				Subscription:   subscription.EncoreName,
+				MessageID:      msgID,
+				Attempt:        deliveryAttempt,
+				Published:      publishTime,
+				DecodedPayload: msg,
+				Payload:        marshalParams(mgr.json, msg),
 			},
-			Payload: msg,
-			Inputs:  [][]byte{data},
-			DefLoc:  staticCfg.TraceIdx,
-			Traced:  tracingEnabled,
-
-			// Unset for subscriptions
-			UID:      "",
-			AuthData: nil,
-			ParentID: model.SpanID{},
+			DefLoc: staticCfg.TraceIdx,
+			Traced: tracingEnabled,
 		}
 		req.Logger = &log
 
@@ -164,7 +161,11 @@ func NewSubscription[T any](topic *Topic[T], name string, subscriptionCfg Subscr
 		err = panicCatchWrapper(ctx, msg)
 
 		if curr.Trace != nil {
-			curr.Trace.FinishRequest(req, nil, err)
+			resp := &model.Response{
+				Err:        err,
+				HTTPStatus: errs.HTTPStatus(err),
+			}
+			curr.Trace.FinishRequest(req, resp)
 		}
 		mgr.rt.FinishRequest()
 
@@ -199,4 +200,9 @@ func (t *Topic[T]) getSubscriptionConfig(name string) (*config.PubsubSubscriptio
 	}
 
 	return subscription, staticCfg
+}
+
+func marshalParams[Resp any](json jsoniter.API, resp Resp) []byte {
+	data, _ := json.Marshal(resp)
+	return data
 }

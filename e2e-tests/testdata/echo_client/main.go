@@ -87,9 +87,9 @@ func main() {
 
 	// Full marshalling test with randomised payloads
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	headerBytes := make([]byte, r.Intn(128))
-	queryBytes := make([]byte, r.Intn(128))
-	bodyBytes := make([]byte, r.Intn(128))
+	headerBytes := make([]byte, 1+r.Intn(128))
+	queryBytes := make([]byte, 1+r.Intn(128))
+	bodyBytes := make([]byte, 1+r.Intn(128))
 	r.Read(headerBytes)
 	r.Read(queryBytes)
 	r.Read(bodyBytes)
@@ -229,6 +229,17 @@ func main() {
 		assert(err, nil, "expected no error when unmarshalling the response body")
 
 		assert(response, &responseType{"this is a test body", "test", "hello", "bar"}, "expected the response to match")
+	}
+
+	{
+		bodyStr := "test body"
+		req, err := http.NewRequest("GET", "?foo=bar", strings.NewReader(bodyStr))
+		assert(err, nil, "expected no error creating request")
+		resp, err := api.Di.Three(ctx, req)
+		assert(err, nil, "expected no error from DI raw endpoint")
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		assert(string(body), bodyStr, "expected response body to echo incoming request body")
 
 	}
 

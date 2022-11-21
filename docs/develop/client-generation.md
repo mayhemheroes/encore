@@ -1,6 +1,8 @@
 ---
+seotitle: Automatic API Client Generation
+seodesc: Learn how you can use automatic API client generation to get clients for your backend. See how to integrate with your frontend using a type-safe generated client.
 title: Client Library Generation
-subtitle: Stop writing the same types everywhere, let us write them for you.
+subtitle: Stop writing the same types everywhere
 ---
 
 One of Encore's core principles is writing a scalable distributed backend should be no more difficult than writing a
@@ -18,6 +20,7 @@ but always includes all the publicly accessible endpoints, data structures, and 
 Currently, Encore supports generating clients for:
 - `go` - using `net/http` for the underlying HTTP transport.
 - `typescript` - using the browser `fetch` API for the underlying HTTP client.
+- `javascript` - using the browser `fetch` API for the underlying HTTP client.
 
 
 If there's another language you think Encore should support, please either submit a pull request or create a feature
@@ -36,8 +39,8 @@ API's that your clients access otherwise your generated clients could stop worki
 # Generating Clients
 
 To generate a client, download the [Encore CLI](/docs/install#install-the-encore-cli) and run
-```bash
-encore gen client <app-id> --lang=<lang>
+```shell
+$ encore gen client <app-id> --lang=<lang>
 ```
 
 **Environment Selection**

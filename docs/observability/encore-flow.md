@@ -1,5 +1,7 @@
 ---
-title: Encore Flow
+seotitle: Encore Flow automatic microservices architecture diagrams
+seodesc: Visualize your microservices architecture automatically using Encore Flow. Get real-time interactive architecture diagrams for your entire application.
+title: Flow Architecture Diagram
 subtitle: Visualize your cloud microservices architecture
 ---
 

@@ -1,4 +1,6 @@
 ---
+seotitle: Environments – Creating local, preview, and prod environments
+seodesc: Learn how to create all the environments you need for your backend application, local, preview, testing and production. Here's how you keep them in sync!
 title: Environments
 subtitle: The environments you want, with none of the work
 ---
@@ -51,9 +53,11 @@ By default, the local environment runs on `http://localhost:4000`.
 When you've [connected your application to GitHub](/docs/how-to/github), Encore will automatically provision ephemeral Preview Environments
 for each Pull Request. This makes collaborating on PRs much faster. 
 
-Preview Environments are named after the pull request, so PR #72 will create an environment named `pr:72`, and the url will be `https://app.encore.dev/$APP_ID/envs/pr:72`.
+Preview Environments are named after the pull request, so PR #72 will create an environment named `pr:72`, and the url will be `https://app.encore.dev/$APP_ID/envs/pr72`.
 
-See the [infra docs](/docs/deploy/infra#preview-environments) if you're curious about how Preview Environments are provisioned.
+See the [infra docs](/docs/deploy/infra#preview-environments) if you're curious about exactly how Preview Environments are provisioned.
+
+![Preview environment linked in GitHub](/assets/docs/ghpreviewenv.png "Preview environment linked in GitHub")
 
 ## Cloud environments
 
