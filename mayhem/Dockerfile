@@ -1,5 +1,5 @@
 # Grab go 1.17 image
-FROM golang:1.17.13 as fuzzbuilder
+FROM golang:1.23.13 as fuzzbuilder
 ARG project='encore'
 ARG fuzzTargetPath='runtime/types/uuid'
 # Navigate to fuzz directory
