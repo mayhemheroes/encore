@@ -1,20 +1,15 @@
-# Grab go 1.17 image
-FROM golang:1.23.13 as fuzzbuilder
-ARG project='encore'
-ARG fuzzTargetPath='runtime/types/uuid'
-# Navigate to fuzz directory
-ADD . ${project}
-WORKDIR /go/${project}/runtime/types/uuid
-# Install go-fuzz-build
-RUN go get -u github.com/dvyukov/go-fuzz/go-fuzz@latest github.com/dvyukov/go-fuzz/go-fuzz-build@latest
-# Compile fuzzers
-RUN GO_ENABLED=0 go-fuzz-build -libfuzzer -func=Fuzz -o /fuzz.a .
+FROM golang:1.23 AS builder
 
-# Sanitize fuzzers in clang image
-FROM silkeh/clang:latest as sanitizer
-COPY --from=fuzzbuilder /fuzz.a fuzz.a
-RUN clang -fsanitize=fuzzer /fuzz.a -o /fuzz.libfuzzer
+WORKDIR /src
+COPY . /src/encore
 
-# Copy sanitized fuzzers to ubuntu
-FROM ubuntu:20.04
-COPY --from=sanitizer /fuzz.libfuzzer /
+# Copy fuzz test into the package directory
+COPY mayhem/fuzz_test.go /src/encore/runtime/types/uuid/fuzz_native_test.go
+
+WORKDIR /src/encore/runtime/types/uuid
+
+# Compile native Go fuzz test as libfuzzer binary
+RUN go test -c -fuzz=FuzzFromString -o /fuzz.libfuzzer .
+
+FROM ubuntu:22.04
+COPY --from=builder /fuzz.libfuzzer /fuzz.libfuzzer
